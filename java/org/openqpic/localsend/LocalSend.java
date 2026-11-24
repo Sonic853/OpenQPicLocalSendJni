@@ -9,11 +9,15 @@ import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.FutureTask;
 import java.util.concurrent.TimeUnit;
 
 /** A transfer owner controls sessions; visibility grants a separate, revocable discovery lease. */
 public final class LocalSend implements Closeable {
     public static final int PORT = 53317, MAX_FILES = 256;
+    public static final int MAX_TARGETS = 256;
+    private static final int PARALLEL_SENDS = 3;
     private static final int MAX_JSON = 512 * 1024, MAX_CLIENTS = 24;
     private static final String API = "/api/localsend/v2/";
     private final String local, fingerprint, model;
@@ -28,7 +32,9 @@ public final class LocalSend implements Closeable {
     private boolean visible;
     private int epoch, burst;
     private long nextBeacon;
-    private Session incoming, outgoing;
+    private Session incoming;
+    private final Map<String,Session> outgoing = new LinkedHashMap<>();
+    private int sendWorkers;
 
     public interface Events {
         void peer(Peer peer);
@@ -86,14 +92,9 @@ public final class LocalSend implements Closeable {
         int tries; boolean busy, done, failed; long bytes;
         FileState(Item i) { item=i; }
     }
-    private static final class Session implements Cancellation {
-        final String key = uuid(); final Peer peer;
-        final Map<String,FileState> files = new LinkedHashMap<>();
-        final Set<Integer> sockets = new HashSet<>();
-        final CountDownLatch decision = new CountDownLatch(1);
-        CountDownLatch pinPrompt; String enteredPin, remoteId;
-        Set<String> selected; volatile boolean cancelled; boolean offered; int percent;
-        Session(Peer p) { peer=p; }
+    private static class CancelToken implements Cancellation {
+        CancelToken() {}
+        volatile boolean cancelled;
         private Runnable interrupt;
         public boolean cancelled() { return cancelled; }
         public synchronized void onCancel(Runnable r) {
@@ -104,6 +105,43 @@ public final class LocalSend implements Closeable {
             cancelled=true;
             if(interrupt!=null) { thread(interrupt); interrupt=null; }
         }
+    }
+    /** A group opens/stages its share URIs once. The last job releases them after native reads exit. */
+    private static final class Batch extends CancelToken {
+        final Map<String,Source> sources=new LinkedHashMap<>();
+        final FutureTask<Void> prepare;
+        int live; private int refs;
+        Batch(int targets,int count,Selection selection) {
+            live=refs=targets;
+            prepare=new FutureTask<>(()->{
+                for(int i=0;i<count;i++) {
+                    if(cancelled) throw new IOException("Cancelled");
+                    Source source=selection.open(i,this); String id=source.item().id;
+                    if(sources.containsKey(id)) { source.close(); throw new IOException("Duplicate file ID"); }
+                    sources.put(id,source);
+                }
+                return null;
+            });
+        }
+        void load() throws Exception {
+            prepare.run(); // at most one worker opens sources, including non-seekable providers
+            try { prepare.get(); }
+            catch(ExecutionException e) { throw new IOException("Cannot open files: "+e.getCause().getMessage(),e.getCause()); }
+        }
+        void release() {
+            synchronized(this) { if(--refs!=0) return; }
+            for(Source source:sources.values()) try { source.close(); } catch(IOException ignored) {}
+            sources.clear();
+        }
+    }
+    private static final class Session extends CancelToken {
+        final String key = uuid(); final Peer peer; final Batch batch;
+        final Map<String,FileState> files = new LinkedHashMap<>();
+        final Set<Integer> sockets = new HashSet<>();
+        final CountDownLatch decision = new CountDownLatch(1);
+        CountDownLatch pinPrompt; String enteredPin, remoteId;
+        Set<String> selected; boolean offered,started; int percent;
+        Session(Peer p,Batch batch) { peer=p; this.batch=batch; }
     }
     private static final class Status extends Exception {
         final int code;
@@ -145,10 +183,15 @@ public final class LocalSend implements Closeable {
     }
     public int port() { return port; }
     public boolean isOpen() { return open; }
-    public synchronized boolean hasWork() { return incoming!=null || outgoing!=null; }
-    public synchronized boolean sending() { return outgoing!=null; }
+    public synchronized boolean hasWork() { return incoming!=null || !outgoing.isEmpty(); }
+    public synchronized boolean sending() { return !outgoing.isEmpty(); }
+    public synchronized boolean sendingTo(Peer p) {
+        for(Session s:outgoing.values()) if(s.peer.fingerprint.equals(p.fingerprint) ||
+                s.peer.ip.equals(p.ip) && s.peer.port==p.port) return true;
+        return false;
+    }
     public synchronized boolean hasSession(String key) {
-        return incoming!=null && incoming.key.equals(key) || outgoing!=null && outgoing.key.equals(key);
+        return incoming!=null && incoming.key.equals(key) || outgoing.containsKey(key);
     }
     private synchronized JSONObject info() throws JSONException {
         return new JSONObject().put("alias",alias).put("version","2.2").put("deviceModel",model)
@@ -223,7 +266,9 @@ public final class LocalSend implements Closeable {
         }
     }
     private boolean knownPeer(String ip) {
-        return incoming!=null && incoming.peer.ip.equals(ip) || outgoing!=null && outgoing.peer.ip.equals(ip);
+        if(incoming!=null && incoming.peer.ip.equals(ip)) return true;
+        for(Session s:outgoing.values()) if(s.offered && s.peer.ip.equals(ip)) return true;
+        return false;
     }
     private synchronized boolean discovering(int stamp) { return visible && epoch==stamp; }
     private synchronized void beacon(byte[] packet,int stamp) {
@@ -361,7 +406,7 @@ public final class LocalSend implements Closeable {
         verifyPin(ip,supplied);
         JSONObject offer=json(fd,frame), files=offer.getJSONObject("files");
         if(files.length()==0 || files.length()>MAX_FILES) throw new Status(400,"Invalid file count");
-        Session s=new Session(described(offer.getJSONObject("info"),ip));
+        Session s=new Session(described(offer.getJSONObject("info"),ip),null);
         List<Item> display=new ArrayList<>(); long total=0;
         for(Iterator<String> it=files.keys();it.hasNext();) {
             String id=it.next(); JSONObject f=files.getJSONObject(id);
@@ -454,7 +499,7 @@ public final class LocalSend implements Closeable {
         for(FileState f:s.files.values()) if(!f.done && !f.failed) return false; return true;
     }
     private synchronized void progress(Session s,String id,long count) {
-        if(!open || s.cancelled || (s!=incoming && s!=outgoing)) return;
+        if(!open || s.cancelled || (s!=incoming && !outgoing.containsKey(s.key))) return;
         FileState f=s.files.get(id); f.bytes=count;
         double size=0,sent=0;
         for(FileState x:s.files.values()) { size+=x.item.size; sent+=x.bytes; }
@@ -462,16 +507,24 @@ public final class LocalSend implements Closeable {
         events.update(s.key,s.peer.alias+" · "+f.item.name,s.percent,false);
     }
     private synchronized void end(Session s,String label) {
-        if(s==null || (s!=incoming && s!=outgoing)) return;
-        stop(s); if(s==incoming) incoming=null; else outgoing=null;
+        if(s==null || (s!=incoming && outgoing.remove(s.key)==null)) return;
+        stop(s);
+        if(s==incoming) incoming=null;
+        else {
+            if(--s.batch.live==0) s.batch.interruptIO();
+            if(!s.started) s.batch.release(); // a cancelled queued job will never get a worker
+        }
         retireIfIdle();
         events.update(s.key,s.peer.alias+" · "+label,"Sent".equals(label)||"Received".equals(label)?100:s.percent,true);
     }
     private Session cancellable(String ip,String id) {
         // A cancel without sessionId is valid for a pending incoming offer.
-        if(incoming!=null && incoming.peer.ip.equals(ip) && Objects.equals(incoming.remoteId,id)) return incoming;
-        if(id!=null && outgoing!=null && outgoing.peer.ip.equals(ip) && id.equals(outgoing.remoteId)) return outgoing;
-        return null;
+        Session match=incoming!=null && incoming.peer.ip.equals(ip) && Objects.equals(incoming.remoteId,id)?incoming:null;
+        if(id!=null) for(Session s:outgoing.values()) if(s.peer.ip.equals(ip) && id.equals(s.remoteId)) {
+            if(match!=null) return null; // same IP + remote ID cannot identify one of two peers
+            match=s;
+        }
+        return match;
     }
     private synchronized void remoteCancel(String ip,String id) throws Status {
         Session s=cancellable(ip,id);
@@ -479,9 +532,9 @@ public final class LocalSend implements Closeable {
         end(s,"Cancelled");
     }
     public synchronized void cancel(String key) {
-        Session s=incoming!=null && incoming.key.equals(key)?incoming:outgoing;
-        if(s==null || !s.key.equals(key)) return;
-        boolean notify=s==outgoing?s.offered:s.remoteId!=null;
+        Session s=incoming!=null && incoming.key.equals(key)?incoming:outgoing.get(key);
+        if(s==null) return;
+        boolean notify=s!=incoming?s.offered:s.remoteId!=null;
         end(s,"Cancelled"); if(notify) notifyCancel(s);
     }
     private void notifyCancel(Session s) {
@@ -499,26 +552,44 @@ public final class LocalSend implements Closeable {
         });
     }
     public synchronized void enterPin(String key,String value) {
-        if(outgoing!=null && outgoing.key.equals(key) && outgoing.pinPrompt!=null) {
-            outgoing.enteredPin=value; outgoing.pinPrompt.countDown();
+        Session s=outgoing.get(key);
+        if(s!=null && s.pinPrompt!=null) {
+            s.enteredPin=value; s.pinPrompt.countDown();
         }
     }
-    public synchronized void send(Peer peer,int count,Selection selection) {
-        if(!visible || outgoing!=null || count<1 || count>MAX_FILES || !"http".equals(peer.protocol)) {
-            events.problem("Cannot start transfer"); return;
+    public void send(Peer peer,int count,Selection selection) { send(Collections.singletonList(peer),count,selection); }
+    public synchronized boolean send(List<Peer> peers,int count,Selection selection) {
+        if(!visible || count<1 || count>MAX_FILES || peers.isEmpty() || peers.size()>MAX_TARGETS-outgoing.size()) {
+            events.problem("Cannot start transfer"); return false;
         }
-        Session s=outgoing=new Session(peer);
-        events.update(s.key,peer.alias+" · …",0,false);
-        thread(()->sendFiles(s,count,selection));
+        Set<String> ids=new HashSet<>(), addresses=new HashSet<>();
+        for(Peer p:peers) if(!"http".equals(p.protocol) || !ids.add(p.fingerprint) ||
+                !addresses.add(p.ip+":"+p.port) || sendingTo(p)) {
+            events.problem("Unavailable recipient: "+p.alias); return false;
+        }
+        Batch batch=new Batch(peers.size(),count,selection);
+        for(Peer p:peers) {
+            Session s=new Session(p,batch); outgoing.put(s.key,s);
+            events.update(s.key,p.alias+" · Queued",0,false);
+        }
+        dispatch(); return true;
     }
-    private void sendFiles(Session s,int count,Selection selection) {
-        Map<String,Source> sources=new LinkedHashMap<>();
+    private void dispatch() { // endpoint lock held; queued jobs are already owned by the service
+        for(Session s:outgoing.values()) {
+            if(sendWorkers>=PARALLEL_SENDS) return;
+            if(s.started) continue;
+            s.started=true; ++sendWorkers;
+            events.update(s.key,s.peer.alias+" · …",0,false);
+            thread(()->sendFiles(s));
+        }
+    }
+    private void sendFiles(Session s) {
+        Batch batch=s.batch;
         try {
+            check(s); batch.load(); check(s);
             JSONObject files=new JSONObject();
-            for(int i=0;i<count;i++) {
-                check(s); Source source=selection.open(i,s); Item f=source.item();
-                sources.put(f.id,source); files.put(f.id,f.json());
-                synchronized(this) { s.files.put(f.id,new FileState(f)); }
+            for(Source source:batch.sources.values()) {
+                Item f=source.item(); files.put(f.id,f.json()); s.files.put(f.id,new FileState(f));
             }
             JSONObject offer=new JSONObject().put("info",info()).put("files",files);
             Reply r; String supplied=null;
@@ -541,7 +612,7 @@ public final class LocalSend implements Closeable {
                 for(Iterator<String> it=s.files.keySet().iterator();it.hasNext();) if(!tokens.has(it.next())) it.remove();
             }
             for(Iterator<String> it=tokens.keys();it.hasNext();) {
-                String id=it.next(); Source source=sources.get(id);
+                String id=it.next(); Source source=batch.sources.get(id);
                 if(source==null) throw new IOException("Unknown file ID");
                 String path="upload?sessionId="+enc(s.remoteId)+"&fileId="+enc(id)+"&token="+enc(text(tokens,id,512));
                 for(int attempt=1;;attempt++) {
@@ -553,8 +624,11 @@ public final class LocalSend implements Closeable {
             end(s,"Sent");
         } catch(Exception e) {
             synchronized(this) {
-                if(open && outgoing==s) { boolean notify=s.remoteId!=null; end(s,reason(e)); if(notify) notifyCancel(s); }
+                if(outgoing.containsKey(s.key)) { boolean notify=s.remoteId!=null; end(s,reason(e)); if(notify) notifyCancel(s); }
             }
-        } finally { for(Source source:sources.values()) try { source.close(); } catch(IOException ignored) {} }
+        } finally {
+            try { batch.release(); }
+            finally { synchronized(this) { --sendWorkers; dispatch(); } }
+        }
     }
 }

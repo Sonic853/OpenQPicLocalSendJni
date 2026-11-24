@@ -258,10 +258,11 @@ JNIEXPORT void FN(receiveFile)(ENV, jint fd, jlong frame, jint out, jlong size, 
 }
 JNIEXPORT void FN(sendFile)(ENV, jint fd, jint src, jlong offset, jlong size, jobject callback) {
     char buf[BLOCK]; int64_t sent = 0; meter m = {e,callback,NULL,0};
-    if (offset < 0 || size < 0 || lseek64(src,offset,SEEK_SET) < 0) { fail(e,"Unseekable upload source"); return; }
+    if (offset < 0 || size < 0 || offset > INT64_MAX-size) { fail(e,"Invalid upload range"); return; }
     while (sent < size) {
         size_t want = size-sent < BLOCK ? (size_t)(size-sent) : BLOCK;
-        ssize_t n = read(src,buf,want);
+        // One immutable source can serve several peers (and retries) at independent offsets.
+        ssize_t n = pread64(src,buf,want,offset+sent);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) { fail(e,"Incomplete upload source"); return; }
         if (all(e,fd,buf,(size_t)n,1)) return;

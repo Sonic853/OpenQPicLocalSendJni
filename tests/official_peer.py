@@ -26,16 +26,18 @@ assert "files, decision_tx, .." in helpers and "let path = dir.join(&file_id);" 
 gate = r'''if let Ok(dir) = std::env::var("OPENQPIC_TEST_GATE") {
                             let dir=PathBuf::from(dir);
                             std::fs::write(dir.join("waiting"), b"prepare").unwrap();
-                            tokio::time::timeout(Duration::from_secs(60),async {
+                            tokio::time::timeout(Duration::from_secs(120),async {
                                 while !dir.join("resume").exists() { tokio::time::sleep(Duration::from_millis(50)).await; }
                             }).await.unwrap();
                         }
                         '''
 helpers = helpers.replace("files, decision_tx, ..", "ip, files, decision_tx, ..").replace(
-    "match accept {", "match accept && ip.ip.is_loopback() && files.len() == 1 && "
-    "files.values().all(|f| f.size == 262912) {").replace(
-    "let path = dir.join(&file_id);", 'let path = dir.join("fixture.bin");').replace(
-    "let _ = decision_tx.send(decision);",gate+"let _ = decision_tx.send(decision);")
+    "match accept {", "match accept && ip.ip.is_loopback() && (1..=2).contains(&files.len()) && "
+    "files.values().all(|f| f.size == 262912 || f.size == 196611) {").replace(
+    "let path = dir.join(&file_id);", 'let path = dir.join(sha256_hex(file_id.as_bytes()));').replace(
+    "let _ = decision_tx.send(decision);",gate+"let _ = decision_tx.send(decision);").replace(
+    '"Test Server".to_string()', 'std::env::var("OPENQPIC_TEST_NAME").unwrap_or_else(|_| "Test Server".to_string())').replace(
+    '"server-fingerprint".to_string()', 'std::env::var("OPENQPIC_TEST_NAME").unwrap_or_else(|_| "server-fingerprint".to_string())')
 def chunk(tag,data):
     return struct.pack(">I",len(data))+tag+data+struct.pack(">I",zlib.crc32(tag+data))
 png=b"\x89PNG\r\n\x1a\n"+chunk(b"IHDR",struct.pack(">2I5B",2,2,8,2,0,0,0))
@@ -52,11 +54,14 @@ async fn main() {
     let args: Vec<_> = std::env::args().collect();
     if args[1] == "receive" || args[1] == "receive-gated" {
         if args[1] == "receive-gated" { std::env::set_var("OPENQPIC_TEST_GATE",&args[3]); }
+        if let Some(name)=args.get(4) { std::env::set_var("OPENQPIC_TEST_NAME",name); }
+        let expected=args.get(5).map_or(1,|n| n.parse::<usize>().unwrap());
+        assert!((1..=2).contains(&expected));
         let dir=PathBuf::from(&args[2]); std::fs::create_dir_all(&dir).unwrap();
-        let server=start_test_server(None,true,Some(dir)).await;
+        let server=start_test_server(None,!args.get(6).is_some_and(|s| s=="decline"),Some(dir)).await;
         println!("PORT={}",server.port);
         tokio::time::timeout(Duration::from_secs(180),async {
-            while server.received.lock().await.is_empty() { tokio::time::sleep(Duration::from_millis(100)).await; }
+            while server.received.lock().await.len()<expected { tokio::time::sleep(Duration::from_millis(100)).await; }
         }).await.unwrap();
         println!("RECEIVED={:?}",server.received.lock().await.keys()); return;
     }
