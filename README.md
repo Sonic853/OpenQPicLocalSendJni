@@ -6,7 +6,9 @@ OpenQPic 的 LocalSend v2.2 明文 HTTP 传输组件。Android 独立库名为 *
 - `java/org/openqpic/localsend/`：JNI 声明、设备公告和 HTTP 回注册、`info/register/prepare-upload/upload/cancel`、逐文件 token、用户确认、PIN、并发接收与校验重试。所有线上文本使用标准 UTF-8。`/v1/info` 仅用于旧客户端探测。
 - 应用负责用户界面、选择网卡、`MulticastLock`、URI 授权、持有 FD、校验本地文件、完成后向 MediaStore/下载目录发布。文件正文不经过 JNI 字节数组。
 
-一个前台界面创建一个 `LocalSend`。`close()` 同步关闭两个监听入口，唤醒待确认请求并中断活跃连接。只在已有会话需要时通知对端取消。没有进程级守护服务、开机广播或后台扫描。
+应用前台服务持有 `LocalSend` 会话，界面控制发现。`hide()` / `close()` 立即退出组播，停止公告、注册、信息查询与新报价；已建立的会话继续使用原地址，后台只受理该会话的授权上传和取消。`show()` 可在同一活跃端点恢复发现或更改名称/PIN。无任务的隐藏端点自行退休。`cancel(key)` 仅取消对应任务，不使用界面生命周期或文件间的计时器代替手动取消。
+
+`Events.receiveType` 在报价时过滤文件并确定 MIME，未通过的 ID 不分配 token；`Sink.isMedia` 在原始字节和可选哈希验证后、发布前核验文件内容。OpenQPic 仅接收系统可识别的图片、视频、音频。
 
 ## 构建
 

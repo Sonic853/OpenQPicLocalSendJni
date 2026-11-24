@@ -11,32 +11,40 @@ import java.util.*;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 
-/** One visible screen owns one endpoint. No singleton, service, timer or receiver can restart it. */
+/** A transfer owner controls sessions; visibility grants a separate, revocable discovery lease. */
 public final class LocalSend implements Closeable {
     public static final int PORT = 53317, MAX_FILES = 256;
     private static final int MAX_JSON = 512 * 1024, MAX_CLIENTS = 24;
     private static final String API = "/api/localsend/v2/";
-    private final String local, fingerprint, alias, model, pin;
+    private final String local, fingerprint, model;
+    private String alias, pin;
     private final Events events;
     private final Set<Integer> clients = new HashSet<>();
+    private final Set<Integer> discoverySockets = new HashSet<>(), admitted = new HashSet<>();
     private final Map<String, Long> probes = new LinkedHashMap<>();
     private final Map<String, long[]> pinFailures = new LinkedHashMap<>();
     private int listener = -1, udp = -1, port, registering;
     private volatile boolean open;
+    private boolean visible;
+    private int epoch, burst;
+    private long nextBeacon;
     private Session incoming, outgoing;
 
     public interface Events {
         void peer(Peer peer);
-        void offer(String key, Peer peer, List<Item> files);
+        /** Canonical acceptable MIME, or null to omit this item before issuing any token. */
+        String receiveType(Item item);
+        void offer(String key, Peer peer, List<Item> files, int skipped);
         void needPin(String key, Peer peer);
         void update(String key, String label, int percent, boolean finished);
         void problem(String reason);
-        Sink destination(Item item) throws IOException;
+        Sink destination(Item item,Cancellation cancellation) throws IOException;
     }
     /** The owner keeps the FD valid until close. Commit makes a verified file visible. */
     public interface Sink extends Closeable {
         int fd();
         boolean matches(String sha256) throws IOException;
+        boolean isMedia() throws IOException;
         void commit() throws IOException;
     }
     public interface Source extends Closeable {
@@ -44,15 +52,21 @@ public final class LocalSend implements Closeable {
         int fd();
         long offset();
     }
-    public interface Selection { Source open(int index) throws IOException; }
+    public interface Cancellation {
+        boolean cancelled();
+        /** Hook for the single outgoing provider open; clear it when the open returns. */
+        void onCancel(Runnable interrupt);
+    }
+    public interface Selection { Source open(int index, Cancellation cancellation) throws IOException; }
     public static final class Peer {
-        public final String alias, ip, fingerprint, protocol;
+        public final String alias, ip, fingerprint, protocol, deviceType, deviceModel;
         public final int port;
         Peer(JSONObject j, String ip, int port, String protocol) throws Exception {
             this.alias = text(j,"alias",256); this.fingerprint = text(j,"fingerprint",256);
             if (!text(j,"version",32).startsWith("2.") || port < 1 || port > 65535 ||
                     !("http".equals(protocol) || "https".equals(protocol))) throw new JSONException("Invalid peer");
             this.ip = ip; this.port = port; this.protocol = protocol;
+            this.deviceType=j.optString("deviceType","unknown"); this.deviceModel=j.optString("deviceModel","");
         }
         @Override public String toString() { return alias; }
     }
@@ -69,18 +83,27 @@ public final class LocalSend implements Closeable {
     }
     private static final class FileState {
         final Item item; final String token = uuid();
-        int tries; boolean busy, done; long bytes;
+        int tries; boolean busy, done, failed; long bytes;
         FileState(Item i) { item=i; }
     }
-    private static final class Session {
+    private static final class Session implements Cancellation {
         final String key = uuid(); final Peer peer;
         final Map<String,FileState> files = new LinkedHashMap<>();
         final Set<Integer> sockets = new HashSet<>();
         final CountDownLatch decision = new CountDownLatch(1);
         CountDownLatch pinPrompt; String enteredPin, remoteId;
-        Set<String> selected; boolean cancelled, offered;
-        long activity = now();
+        Set<String> selected; volatile boolean cancelled; boolean offered; int percent;
         Session(Peer p) { peer=p; }
+        private Runnable interrupt;
+        public boolean cancelled() { return cancelled; }
+        public synchronized void onCancel(Runnable r) {
+            if(!cancelled) interrupt=r;
+            else if(r!=null) thread(r);
+        }
+        synchronized void interruptIO() {
+            cancelled=true;
+            if(interrupt!=null) { thread(interrupt); interrupt=null; }
+        }
     }
     private static final class Status extends Exception {
         final int code;
@@ -114,72 +137,102 @@ public final class LocalSend implements Closeable {
         catch (IOException busy) { e.listener=Wire.listen(local,0); }
         try {
             e.port=Wire.port(e.listener);
-            try { e.udp=Wire.multicast(local); }
-            catch (IOException noGroup) { events.problem("Multicast: "+reason(noGroup)); }
             e.open=true;
+            e.show(alias,pin);
             thread(e::loop);
             return e;
         } catch (RuntimeException ex) { e.close(); throw ex; }
     }
     public int port() { return port; }
     public boolean isOpen() { return open; }
-    private JSONObject info() throws JSONException {
+    public synchronized boolean hasWork() { return incoming!=null || outgoing!=null; }
+    public synchronized boolean sending() { return outgoing!=null; }
+    public synchronized boolean hasSession(String key) {
+        return incoming!=null && incoming.key.equals(key) || outgoing!=null && outgoing.key.equals(key);
+    }
+    private synchronized JSONObject info() throws JSONException {
         return new JSONObject().put("alias",alias).put("version","2.2").put("deviceModel",model)
                 .put("deviceType","mobile").put("fingerprint",fingerprint).put("port",port)
                 .put("protocol","http").put("download",false);
     }
-    @Override public synchronized void close() {
+    public synchronized void show(String name,String receivePin) {
+        if(!open) throw new IllegalStateException("Retired endpoint");
+        boolean changed=!Objects.equals(alias,name);
+        if(!Objects.equals(pin,receivePin)) pinFailures.clear();
+        alias=name; pin=receivePin;
+        if(!visible) { visible=true; epoch++; probes.clear(); }
+        else if(!changed && udp>=0) return;
+        if(udp<0) try { udp=Wire.multicast(local); }
+        catch(IOException ex) { events.problem("Multicast: "+reason(ex)); }
+        burst=0; nextBeacon=now()+100; notifyAll();
+    }
+    public synchronized void hide() {
+        if(visible) { visible=false; epoch++; }
+        if(udp>=0) { Wire.close(udp); udp=-1; }
+        for(int fd:discoverySockets) Wire.shutdown(fd);
+        retireIfIdle(); notifyAll();
+    }
+    @Override public void close() { hide(); }
+    private void retireIfIdle() {
+        if(visible || hasWork()) return;
         open=false;
         if(listener>=0) { Wire.close(listener); listener=-1; }
-        if(udp>=0) { Wire.close(udp); udp=-1; }
-        for(int fd:clients) Wire.shutdown(fd); // each worker removes & closes exactly once
-        // A verified peer may already be waiting between uploads. Only send the
-        // opaque cancellation, never register or open a listener after closing.
-        if(incoming!=null && incoming.remoteId!=null) notifyCancel(incoming);
-        if(outgoing!=null && outgoing.offered) notifyCancel(outgoing);
-        stop(incoming); stop(outgoing); incoming=outgoing=null; notifyAll();
+        // The final upload/decline may still be writing its HTTP reply. Its worker owns the FD.
+        notifyAll();
     }
     private void stop(Session s) {
         if(s==null) return;
-        s.cancelled=true; s.decision.countDown();
+        s.interruptIO(); s.decision.countDown();
         if(s.pinPrompt!=null) s.pinPrompt.countDown();
         for(int fd:s.sockets) Wire.shutdown(fd);
     }
     private void loop() {
-        try {
-            byte[] beacon=buf(info().put("announce",true).toString());
-            int burst=0; long next=now()+100;
-            while(true) {
-                byte[] packet=null;
-                synchronized(this) {
-                    if(!open) return;
-                    if(udp>=0) {
-                        try {
-                            if(now()>=next) {
-                                Wire.announce(udp,beacon);
-                                next=now()+(burst==0?500:burst==1?2000:30000); ++burst;
-                            }
-                            packet=Wire.datagram(udp);
-                        } catch(IOException ex) { Wire.close(udp); udp=-1; events.problem("Multicast: "+reason(ex)); }
-                    }
-                    for(int i=0;i<8;i++) {
-                        int fd=Wire.accept(listener); if(fd<0) break;
-                        if(clients.size()>=MAX_CLIENTS) Wire.close(fd);
-                        else { clients.add(fd); thread(()->serve(fd)); }
-                    }
-                    if(incoming!=null && incoming.sockets.isEmpty() && now()-incoming.activity>120000) end(incoming,"Timed out");
-                    if(packet==null) wait(60);
+        boolean acceptError=false;
+        while(true) {
+            byte[] packet=null;
+            int stamp;
+            synchronized(this) {
+                if(!open) return;
+                stamp=epoch;
+                if(udp>=0) {
+                    try {
+                        if(now()>=nextBeacon) {
+                            Wire.announce(udp,buf(info().put("announce",true).toString()));
+                            nextBeacon=now()+(burst==0?500:burst==1?2000:30000); ++burst;
+                        }
+                        packet=Wire.datagram(udp);
+                    } catch(IOException | JSONException ex) { Wire.close(udp); udp=-1; events.problem("Multicast: "+reason(ex)); }
                 }
-                if(packet!=null) beacon(packet);
+                for(int i=0;i<8;i++) {
+                    int fd;
+                    try { fd=Wire.accept(listener); acceptError=false; }
+                    catch(IOException ex) {
+                        if(!acceptError) events.problem(reason(ex));
+                        acceptError=true; break;
+                    }
+                    if(fd<0) break;
+                    if(clients.size()>=MAX_CLIENTS) { Wire.close(fd); continue; }
+                    if(!visible) try {
+                        if(!knownPeer(Wire.peer(fd))) { Wire.close(fd); continue; }
+                    } catch(IOException disconnected) { Wire.close(fd); continue; }
+                    clients.add(fd); thread(()->serve(fd,stamp));
+                }
+                if(packet==null) try { wait(acceptError?500:60); } catch(InterruptedException ignored) {}
             }
-        } catch(Exception e) { synchronized(this) { if(open) { close(); events.problem(reason(e)); } } }
+            if(packet!=null) beacon(packet,stamp);
+        }
     }
-    private void beacon(byte[] packet) {
+    private boolean knownPeer(String ip) {
+        return incoming!=null && incoming.peer.ip.equals(ip) || outgoing!=null && outgoing.peer.ip.equals(ip);
+    }
+    private synchronized boolean discovering(int stamp) { return visible && epoch==stamp; }
+    private synchronized void beacon(byte[] packet,int stamp) {
         try {
+            if(!discovering(stamp)) return;
             String s=utf(packet); int i=s.indexOf('\n'); JSONObject j=new JSONObject(s.substring(i+1));
             Peer p=described(j,s.substring(0,i));
             if(fingerprint.equals(p.fingerprint)) return;
-            if("https".equals(p.protocol)) { synchronized(this) { if(open) events.peer(p); } return; }
+            if("https".equals(p.protocol)) { events.peer(p); return; }
             probe(p.ip,p.port,false);
         } catch(Exception ignored) { /* Not a LocalSend v2 announcement. */ }
     }
@@ -187,37 +240,42 @@ public final class LocalSend implements Closeable {
         return new Peer(j,ip,j.getInt("port"),j.getString("protocol"));
     }
     public synchronized void probe(String ip,int port,boolean manual) {
-        if(!open || registering>=4 || port<1 || port>65535 || !ip.matches("[0-9.]{7,15}")) return;
+        if(!visible || registering>=4 || port<1 || port>65535 || !ip.matches("[0-9.]{7,15}")) return;
+        final int stamp=epoch;
         String key=ip+":"+port; Long last=probes.get(key);
         if(!manual && last!=null && now()-last<5000) return;
         if(probes.size()>=256) probes.remove(probes.keySet().iterator().next());
         probes.put(key,now()); registering++;
         thread(()->{
             try {
-                Reply r=request(ip,port,"register",info(),null,null,8);
+                Reply r=request(ip,port,"register",info(),null,null,8,stamp);
                 if(r.code!=200) throw new IOException("Register: HTTP "+r.code);
                 Peer p=new Peer(r.json(),ip,port,"http");
-                synchronized(this) { if(open && !fingerprint.equals(p.fingerprint)) events.peer(p); }
-            } catch(Exception ex) { synchronized(this) { if(open && manual) events.problem(reason(ex)); } }
+                synchronized(this) { if(discovering(stamp) && !fingerprint.equals(p.fingerprint)) events.peer(p); }
+            } catch(Exception ex) { synchronized(this) { if(discovering(stamp) && manual) events.problem(reason(ex)); } }
             finally { synchronized(this) { registering--; } }
         });
     }
     private synchronized void check(Session s) throws IOException {
         if(!open || (s!=null && s.cancelled)) throw new IOException("Cancelled");
     }
-    private synchronized int socket(Session s) throws IOException {
+    private synchronized int socket(Session s,int stamp) throws IOException {
         check(s);
-        if(clients.size()>=MAX_CLIENTS+4) throw new IOException("Busy");
-        int fd=Wire.socket(); clients.add(fd); if(s!=null) s.sockets.add(fd); return fd;
+        if(s==null && !discovering(stamp)) throw new IOException("Discovery closed");
+        if(s==null && clients.size()>=MAX_CLIENTS+4) throw new IOException("Busy");
+        int fd=Wire.socket(); clients.add(fd);
+        if(s!=null) s.sockets.add(fd); else discoverySockets.add(fd);
+        return fd;
     }
     private synchronized void release(int fd,Session s) {
         if(s!=null) s.sockets.remove(fd);
-        clients.remove(fd); Wire.close(fd);
+        discoverySockets.remove(fd); admitted.remove(fd); clients.remove(fd); Wire.close(fd);
     }
-    private Reply request(String ip,int port,String route,JSONObject json,Source source,Session s,int timeout) throws Exception {
-        int fd=socket(s);
+    private Reply request(String ip,int port,String route,JSONObject json,Source source,Session s,int timeout,int stamp) throws Exception {
+        int fd=socket(s,stamp);
         try {
             Wire.connect(fd,local,ip,port,3500); check(s); Wire.timeout(fd,timeout);
+            if(s==null && !discovering(stamp)) throw new IOException("Discovery closed");
             byte[] data=json==null?new byte[0]:buf(json.toString());
             if(data.length>MAX_JSON) throw new IOException("Offer too large");
             long n=source!=null?source.item().size:data.length;
@@ -241,7 +299,8 @@ public final class LocalSend implements Closeable {
         return new JSONObject(utf(Wire.body(fd,frame,MAX_JSON)));
     }
     private static String enc(String s) throws Exception { return URLEncoder.encode(s,"UTF-8"); }
-    private void serve(int fd) {
+    private void serve(int fd,int stamp) {
+        boolean sessionRoute=false;
         try {
             Wire.timeout(fd,20);
             String ip=Wire.peer(fd);
@@ -253,22 +312,31 @@ public final class LocalSend implements Closeable {
                 String[] kv=pair.split("=",2);
                 if(kv.length==2) q.put(URLDecoder.decode(kv[0],"UTF-8"),URLDecoder.decode(kv[1],"UTF-8"));
             }
-            check(null);
+            synchronized(this) {
+                boolean uploading="POST".equals(first[0]) && path.equals(API+"upload");
+                boolean cancelling="POST".equals(first[0]) && path.equals(API+"cancel");
+                if(uploading) sessionRoute=ticket(ip,q)!=null;
+                if(cancelling) sessionRoute=cancellable(ip,q.get("sessionId"))!=null;
+                if(!discovering(stamp) && !sessionRoute) return; // no identifying response, even to /v1/info
+                if(!uploading && !cancelling) discoverySockets.add(fd);
+            }
             if("GET".equals(first[0]) && (path.equals(API+"info") || path.equals("/api/localsend/v1/info")))
                 respond(fd,200,info());
             else if(!"POST".equals(first[0]) || !path.startsWith(API)) throw new Status(404,"Unknown route");
             else switch(path.substring(API.length())) {
                 case "register":
                     Peer p=described(json(fd,frame),ip);
-                    synchronized(this) { check(null); if(!p.fingerprint.equals(fingerprint)) events.peer(p); }
+                    synchronized(this) { if(!discovering(stamp)) return; if(!p.fingerprint.equals(fingerprint)) events.peer(p); }
                     respond(fd,200,info()); break;
-                case "prepare-upload": prepare(fd,ip,q.get("pin"),frame); break;
+                case "prepare-upload": prepare(fd,ip,q.get("pin"),frame,stamp); break;
                 case "upload": upload(fd,ip,q,frame); break;
                 case "cancel": remoteCancel(ip,q.get("sessionId")); respond(fd,200,null); break;
                 default: throw new Status(404,"Unknown route");
             }
         } catch(Exception ex) {
-            try { if(open) respond(fd,ex instanceof Status?((Status)ex).code:400,
+            boolean reply;
+            synchronized(this) { reply=sessionRoute || admitted.contains(fd) || discovering(stamp); }
+            try { if(reply) respond(fd,ex instanceof Status?((Status)ex).code:400,
                     new JSONObject().put("message",reason(ex))); } catch(Exception ignored) {}
         } finally { release(fd,null); }
     }
@@ -289,7 +357,7 @@ public final class LocalSend implements Closeable {
         }
         pinFailures.remove(ip);
     }
-    private void prepare(int fd,String ip,String supplied,long frame) throws Exception {
+    private void prepare(int fd,String ip,String supplied,long frame,int stamp) throws Exception {
         verifyPin(ip,supplied);
         JSONObject offer=json(fd,frame), files=offer.getJSONObject("files");
         if(files.length()==0 || files.length()>MAX_FILES) throw new Status(400,"Invalid file count");
@@ -306,26 +374,30 @@ public final class LocalSend implements Closeable {
                 throw new Status(400,"Invalid file length or checksum");
             total+=size;
             Item item=new Item(id,text(f,"fileName",4096),size,text(f,"fileType",256),hash);
+            String mime=events.receiveType(item);
+            if(mime==null) continue;
+            item=new Item(id,item.name,size,mime,hash);
             display.add(item); s.files.put(id,new FileState(item));
         }
+        if(display.isEmpty()) throw new Status(415,"Only media files are accepted");
         synchronized(this) {
-            check(null); if(incoming!=null) throw new Status(409,"Busy");
-            incoming=s; events.offer(s.key,s.peer,Collections.unmodifiableList(display));
+            if(!discovering(stamp)) return;
+            if(incoming!=null) throw new Status(409,"Busy");
+            discoverySockets.remove(fd); admitted.add(fd);
+            incoming=s; events.offer(s.key,s.peer,Collections.unmodifiableList(display),files.length()-display.size());
         }
         boolean handedOff=false;
         try {
-            long deadline=now()+90000;
-            boolean answered;
-            while(!(answered=s.decision.await(250,TimeUnit.MILLISECONDS)) && now()<deadline) {
+            while(!s.decision.await(250,TimeUnit.MILLISECONDS)) {
                 if(Wire.disconnected(fd)) throw new IOException("Sender disconnected");
             }
             JSONObject tokens=new JSONObject();
             synchronized(this) {
-                if(!answered || s.cancelled || s.selected==null) throw new Status(403,"Declined");
+                if(s.cancelled || s.selected==null) throw new Status(403,"Declined");
                 s.files.keySet().retainAll(s.selected);
                 for(FileState f:s.files.values()) tokens.put(f.item.id,f.token);
                 if(tokens.length()>0) {
-                    s.remoteId=s.key; s.activity=now();
+                    s.remoteId=s.key;
                     events.update(s.key,s.peer.alias+" · …",0,false);
                 }
             }
@@ -339,59 +411,72 @@ public final class LocalSend implements Closeable {
             incoming.selected=ids==null?null:new HashSet<>(ids); incoming.decision.countDown();
         }
     }
+    private FileState ticket(String ip,Map<String,String> q) {
+        Session s=incoming;
+        if(s==null || !s.peer.ip.equals(ip) || s.remoteId==null || !s.remoteId.equals(q.get("sessionId"))) return null;
+        FileState f=s.files.get(q.get("fileId"));
+        return f!=null && f.token.equals(q.get("token"))?f:null;
+    }
     private void upload(int fd,String ip,Map<String,String> q,long frame) throws Exception {
         final Session s; final FileState f;
         synchronized(this) {
             s=incoming;
-            if(s==null || !s.peer.ip.equals(ip) || s.remoteId==null || !s.remoteId.equals(q.get("sessionId")))
-                throw new Status(403,"Invalid session");
-            f=s.files.get(q.get("fileId"));
-            if(f==null || f.done || !f.token.equals(q.get("token"))) throw new Status(403,"Invalid token");
+            f=ticket(ip,q);
+            if(f==null || f.done || f.failed) throw new Status(403,"Invalid token");
             if(f.busy) throw new Status(409,"File in progress");
             if(frame==-1 && f.item.size==0) frame=0; // HTTP request without framing has an empty body
             if(frame==-1 || (frame>=0 && frame!=f.item.size)) throw new Status(400,"Wrong length");
-            f.busy=true; f.tries++; f.bytes=0; s.activity=now(); s.sockets.add(fd);
+            f.busy=true; f.tries++; f.bytes=0; s.sockets.add(fd);
         }
         boolean completed=false, retry=false;
-        try(Sink out=events.destination(f.item)) {
+        try(Sink out=events.destination(f.item,s)) {
+            Wire.timeout(fd,0); // an admitted file is interrupted explicitly, not by UI/idle timers
             Wire.receiveFile(fd,frame,out.fd(),f.item.size,count->progress(s,f.item.id,count));
             if(f.item.hash!=null && !out.matches(f.item.hash)) {
                 retry=f.tries<3; throw new Status(422,"SHA-256 mismatch");
             }
-            // Only fully received and verified files reach this point. Publishing
-            // via a document provider must not hold up onPause's socket shutdown.
+            if(!out.isMedia()) throw new Status(415,"Content is not the offered media");
             check(s); out.commit(); completed=true;
         } catch(IOException e) { throw new Status(500,reason(e)); }
         finally {
             synchronized(this) {
-                f.busy=false; f.done=completed; s.sockets.remove(fd);
-                if(!completed && !retry) end(s,"Failed: "+f.item.name);
-                else if(completed && allDone(s)) end(s,"Received");
+                f.busy=false; f.done=completed; f.failed=!completed && !retry; s.sockets.remove(fd);
+                if(allDone(s)) {
+                    String result="Received";
+                    for(FileState x:s.files.values()) if(x.failed) { result="Failed: "+x.item.name; break; }
+                    end(s,result);
+                }
             }
         }
         respond(fd,200,null);
     }
     private static boolean allDone(Session s) {
-        for(FileState f:s.files.values()) if(!f.done) return false; return true;
+        for(FileState f:s.files.values()) if(!f.done && !f.failed) return false; return true;
     }
     private synchronized void progress(Session s,String id,long count) {
         if(!open || s.cancelled || (s!=incoming && s!=outgoing)) return;
-        s.activity=now(); FileState f=s.files.get(id); f.bytes=count;
+        FileState f=s.files.get(id); f.bytes=count;
         double size=0,sent=0;
         for(FileState x:s.files.values()) { size+=x.item.size; sent+=x.bytes; }
-        events.update(s.key,s.peer.alias+" · "+f.item.name,size==0?0:(int)(sent/size*100),false);
+        s.percent=size==0?0:(int)(sent/size*100);
+        events.update(s.key,s.peer.alias+" · "+f.item.name,s.percent,false);
     }
     private synchronized void end(Session s,String label) {
         if(s==null || (s!=incoming && s!=outgoing)) return;
         stop(s); if(s==incoming) incoming=null; else outgoing=null;
-        events.update(s.key,s.peer.alias+" · "+label,100,true);
+        retireIfIdle();
+        events.update(s.key,s.peer.alias+" · "+label,"Sent".equals(label)||"Received".equals(label)?100:s.percent,true);
+    }
+    private Session cancellable(String ip,String id) {
+        // A cancel without sessionId is valid for a pending incoming offer.
+        if(incoming!=null && incoming.peer.ip.equals(ip) && Objects.equals(incoming.remoteId,id)) return incoming;
+        if(id!=null && outgoing!=null && outgoing.peer.ip.equals(ip) && id.equals(outgoing.remoteId)) return outgoing;
+        return null;
     }
     private synchronized void remoteCancel(String ip,String id) throws Status {
-        // A cancel without sessionId is valid for a pending incoming offer.
-        for(Session s:new Session[]{incoming,outgoing}) {
-            if(s!=null && s.peer.ip.equals(ip) && Objects.equals(s.remoteId,id)) { end(s,"Cancelled"); return; }
-        }
-        throw new Status(403,"Unknown session");
+        Session s=cancellable(ip,id);
+        if(s==null) throw new Status(403,"Unknown session");
+        end(s,"Cancelled");
     }
     public synchronized void cancel(String key) {
         Session s=incoming!=null && incoming.key.equals(key)?incoming:outgoing;
@@ -419,7 +504,7 @@ public final class LocalSend implements Closeable {
         }
     }
     public synchronized void send(Peer peer,int count,Selection selection) {
-        if(!open || outgoing!=null || count<1 || count>MAX_FILES || !"http".equals(peer.protocol)) {
+        if(!visible || outgoing!=null || count<1 || count>MAX_FILES || !"http".equals(peer.protocol)) {
             events.problem("Cannot start transfer"); return;
         }
         Session s=outgoing=new Session(peer);
@@ -431,7 +516,7 @@ public final class LocalSend implements Closeable {
         try {
             JSONObject files=new JSONObject();
             for(int i=0;i<count;i++) {
-                check(s); Source source=selection.open(i); Item f=source.item();
+                check(s); Source source=selection.open(i,s); Item f=source.item();
                 sources.put(f.id,source); files.put(f.id,f.json());
                 synchronized(this) { s.files.put(f.id,new FileState(f)); }
             }
@@ -440,13 +525,13 @@ public final class LocalSend implements Closeable {
             for(;;) {
                 synchronized(this) { check(s); s.offered=true; }
                 r=request(s.peer.ip,s.peer.port,"prepare-upload"+(supplied==null?"":"?pin="+enc(supplied)),
-                        offer,null,s,100);
+                        offer,null,s,0,0);
                 if(r.code!=401) break;
                 CountDownLatch l;
                 synchronized(this) {
                     check(s); s.enteredPin=null; s.pinPrompt=l=new CountDownLatch(1); events.needPin(s.key,s.peer);
                 }
-                if(!l.await(90,TimeUnit.SECONDS) || (supplied=s.enteredPin)==null) throw new IOException("Cancelled");
+                l.await(); if((supplied=s.enteredPin)==null) throw new IOException("Cancelled");
             }
             if(r.code==204) { end(s,"No files requested"); return; }
             if(r.code!=200) throw new IOException("HTTP "+r.code);
@@ -460,7 +545,7 @@ public final class LocalSend implements Closeable {
                 if(source==null) throw new IOException("Unknown file ID");
                 String path="upload?sessionId="+enc(s.remoteId)+"&fileId="+enc(id)+"&token="+enc(text(tokens,id,512));
                 for(int attempt=1;;attempt++) {
-                    r=request(s.peer.ip,s.peer.port,path,null,source,s,30);
+                    r=request(s.peer.ip,s.peer.port,path,null,source,s,0,0);
                     if(r.code==200) break;
                     if(r.code!=422 || attempt>=3) throw new IOException("HTTP "+r.code);
                 }
