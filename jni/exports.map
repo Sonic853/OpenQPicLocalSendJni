@@ -1,0 +1,4 @@
+{
+    global: Java_org_openqpic_localsend_Wire_*;
+    local: *;
+};
