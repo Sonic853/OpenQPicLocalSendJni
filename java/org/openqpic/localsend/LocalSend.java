@@ -23,11 +23,15 @@ public final class LocalSend implements Closeable {
     private final String local, fingerprint, model;
     private String alias, pin;
     private final Events events;
-    private final Set<Integer> clients = new HashSet<>();
-    private final Set<Integer> discoverySockets = new HashSet<>(), admitted = new HashSet<>();
+    private final SystemTls identity;
+    private final boolean receiveEncrypted;
+    private final Set<HttpChannel> clients = new HashSet<>();
+    private final Set<HttpChannel> discoverySockets = new HashSet<>(), admitted = new HashSet<>();
     private final Map<String, Long> probes = new LinkedHashMap<>();
+    private final Map<String, String> verifiedHttps = new LinkedHashMap<>();
     private final Map<String, long[]> pinFailures = new LinkedHashMap<>();
-    private int listener = -1, udp = -1, port, registering;
+    private HttpChannel.Listener listener;
+    private int udp = -1, port, registering;
     private volatile boolean open;
     private boolean visible;
     private int epoch, burst;
@@ -68,12 +72,15 @@ public final class LocalSend implements Closeable {
         public final String alias, ip, fingerprint, protocol, deviceType, deviceModel;
         public final int port;
         Peer(JSONObject j, String ip, int port, String protocol) throws Exception {
-            this.alias = text(j,"alias",256); this.fingerprint = text(j,"fingerprint",256);
+            this.alias = text(j,"alias",256);
+            String claimed = text(j,"fingerprint",256);
+            this.fingerprint = claimed.matches("(?i)[0-9a-f]{64}") ? claimed.toUpperCase(Locale.ROOT) : claimed;
             if (!text(j,"version",32).startsWith("2.") || port < 1 || port > 65535 ||
                     !("http".equals(protocol) || "https".equals(protocol))) throw new JSONException("Invalid peer");
             this.ip = ip; this.port = port; this.protocol = protocol;
             this.deviceType=j.optString("deviceType","unknown"); this.deviceModel=j.optString("deviceModel","");
         }
+        public boolean encrypted() { return "https".equals(protocol); }
         @Override public String toString() { return alias; }
     }
     public static final class Item {
@@ -137,7 +144,7 @@ public final class LocalSend implements Closeable {
     private static final class Session extends CancelToken {
         final String key = uuid(); final Peer peer; final Batch batch;
         final Map<String,FileState> files = new LinkedHashMap<>();
-        final Set<Integer> sockets = new HashSet<>();
+        final Set<HttpChannel> sockets = new HashSet<>();
         final CountDownLatch decision = new CountDownLatch(1);
         CountDownLatch pinPrompt; String enteredPin, remoteId;
         Set<String> selected; boolean offered,started; int percent;
@@ -148,8 +155,8 @@ public final class LocalSend implements Closeable {
         Status(int code,String s) { super(s); this.code=code; }
     }
     private static final class Reply {
-        final int code; final byte[] data;
-        Reply(int c,byte[] d) { code=c; data=d; }
+        final int code; final byte[] data; final String fingerprint;
+        Reply(int c,byte[] d,String fingerprint) { code=c; data=d; this.fingerprint=fingerprint; }
         JSONObject json() throws JSONException { return new JSONObject(utf(data)); }
     }
     private static String uuid() { return UUID.randomUUID().toString(); }
@@ -165,16 +172,28 @@ public final class LocalSend implements Closeable {
     private static void thread(Runnable r) { Thread t=new Thread(r,"OpenQPic-LocalSend"); t.setDaemon(true); t.start(); }
     private static String reason(Exception e) { return e.getMessage()==null ? e.getClass().getSimpleName() : e.getMessage(); }
 
-    private LocalSend(String local,String alias,String fingerprint,String model,String pin,Events events) {
+    private LocalSend(String local,String alias,String fingerprint,String model,String pin,Events events,
+                      SystemTls identity,boolean receiveEncrypted) {
         this.local=local; this.alias=alias; this.fingerprint=fingerprint; this.model=model; this.pin=pin; this.events=events;
+        this.identity=identity; this.receiveEncrypted=receiveEncrypted;
     }
     public static LocalSend start(String local,String alias,String fingerprint,String model,String pin,Events events)
             throws IOException {
-        LocalSend e = new LocalSend(local,alias,fingerprint,model,pin,events);
-        try { e.listener=Wire.listen(local,PORT); }
-        catch (IOException busy) { e.listener=Wire.listen(local,0); }
+        return start(local,alias,fingerprint,model,pin,events,null);
+    }
+    public static LocalSend start(String local,String alias,String fingerprint,String model,String pin,Events events,
+                                  SystemTls identity) throws IOException {
+        return start(local,alias,fingerprint,model,pin,events,identity,identity!=null);
+    }
+    public static LocalSend start(String local,String alias,String fingerprint,String model,String pin,Events events,
+                                  SystemTls identity,boolean receiveEncrypted) throws IOException {
+        if(receiveEncrypted && identity==null) throw new IOException("LocalSend TLS identity unavailable");
+        LocalSend e = new LocalSend(local,alias,identity==null?fingerprint:identity.fingerprint,model,pin,events,identity,receiveEncrypted);
+        SystemTls listenerIdentity=receiveEncrypted?identity:null;
+        try { e.listener=new HttpChannel.Listener(local,PORT,listenerIdentity); }
+        catch (IOException busy) { e.listener=new HttpChannel.Listener(local,0,listenerIdentity); }
         try {
-            e.port=Wire.port(e.listener);
+            e.port=e.listener.port;
             e.open=true;
             e.show(alias,pin);
             thread(e::loop);
@@ -182,6 +201,8 @@ public final class LocalSend implements Closeable {
         } catch (RuntimeException ex) { e.close(); throw ex; }
     }
     public int port() { return port; }
+    /** Protocol advertised for requests to this listener, independent of outbound requests. */
+    public boolean encrypted() { return receiveEncrypted; }
     public boolean isOpen() { return open; }
     public synchronized boolean hasWork() { return incoming!=null || !outgoing.isEmpty(); }
     public synchronized boolean sending() { return !outgoing.isEmpty(); }
@@ -196,14 +217,14 @@ public final class LocalSend implements Closeable {
     private synchronized JSONObject info() throws JSONException {
         return new JSONObject().put("alias",alias).put("version","2.2").put("deviceModel",model)
                 .put("deviceType","mobile").put("fingerprint",fingerprint).put("port",port)
-                .put("protocol","http").put("download",false);
+                .put("protocol",encrypted()?"https":"http").put("download",false);
     }
     public synchronized void show(String name,String receivePin) {
         if(!open) throw new IllegalStateException("Retired endpoint");
         boolean changed=!Objects.equals(alias,name);
         if(!Objects.equals(pin,receivePin)) pinFailures.clear();
         alias=name; pin=receivePin;
-        if(!visible) { visible=true; epoch++; probes.clear(); }
+        if(!visible) { visible=true; epoch++; probes.clear(); verifiedHttps.clear(); }
         else if(!changed && udp>=0) return;
         if(udp<0) try { udp=Wire.multicast(local); }
         catch(IOException ex) { events.problem("Multicast: "+reason(ex)); }
@@ -212,14 +233,14 @@ public final class LocalSend implements Closeable {
     public synchronized void hide() {
         if(visible) { visible=false; epoch++; }
         if(udp>=0) { Wire.close(udp); udp=-1; }
-        for(int fd:discoverySockets) Wire.shutdown(fd);
+        for(HttpChannel fd:discoverySockets) fd.interrupt();
         retireIfIdle(); notifyAll();
     }
     @Override public void close() { hide(); }
     private void retireIfIdle() {
         if(visible || hasWork()) return;
         open=false;
-        if(listener>=0) { Wire.close(listener); listener=-1; }
+        if(listener!=null) { listener.close(); listener=null; }
         // The final upload/decline may still be writing its HTTP reply. Its worker owns the FD.
         notifyAll();
     }
@@ -227,7 +248,7 @@ public final class LocalSend implements Closeable {
         if(s==null) return;
         s.interruptIO(); s.decision.countDown();
         if(s.pinPrompt!=null) s.pinPrompt.countDown();
-        for(int fd:s.sockets) Wire.shutdown(fd);
+        for(HttpChannel fd:s.sockets) fd.interrupt();
     }
     private void loop() {
         boolean acceptError=false;
@@ -247,18 +268,20 @@ public final class LocalSend implements Closeable {
                     } catch(IOException | JSONException ex) { Wire.close(udp); udp=-1; events.problem("Multicast: "+reason(ex)); }
                 }
                 for(int i=0;i<8;i++) {
-                    int fd;
-                    try { fd=Wire.accept(listener); acceptError=false; }
+                    HttpChannel fd;
+                    try { fd=listener.accept(0); acceptError=false; }
                     catch(IOException ex) {
                         if(!acceptError) events.problem(reason(ex));
                         acceptError=true; break;
                     }
-                    if(fd<0) break;
-                    if(clients.size()>=MAX_CLIENTS) { Wire.close(fd); continue; }
+                    if(fd==null) break;
+                    if(clients.size()>=MAX_CLIENTS) { fd.close(); continue; }
                     if(!visible) try {
-                        if(!knownPeer(Wire.peer(fd))) { Wire.close(fd); continue; }
-                    } catch(IOException disconnected) { Wire.close(fd); continue; }
-                    clients.add(fd); thread(()->serve(fd,stamp));
+                        if(!knownPeer(fd.peer())) { fd.close(); continue; }
+                    } catch(IOException disconnected) { fd.close(); continue; }
+                    clients.add(fd);
+                    if(visible && !hasWork()) discoverySockets.add(fd);
+                    thread(()->serve(fd,stamp));
                 }
                 if(packet==null) try { wait(acceptError?500:60); } catch(InterruptedException ignored) {}
             }
@@ -276,27 +299,64 @@ public final class LocalSend implements Closeable {
             if(!discovering(stamp)) return;
             String s=utf(packet); int i=s.indexOf('\n'); JSONObject j=new JSONObject(s.substring(i+1));
             Peer p=described(j,s.substring(0,i));
-            if(fingerprint.equals(p.fingerprint)) return;
-            if("https".equals(p.protocol)) { events.peer(p); return; }
-            probe(p.ip,p.port,false);
+            if(!fingerprint.equals(p.fingerprint)) probe(p);
         } catch(Exception ignored) { /* Not a LocalSend v2 announcement. */ }
     }
     private static Peer described(JSONObject j,String ip) throws Exception {
         return new Peer(j,ip,j.getInt("port"),j.getString("protocol"));
     }
     public synchronized void probe(String ip,int port,boolean manual) {
+        probe(ip,port,manual,receiveEncrypted,null);
+    }
+    public synchronized void probe(String ip,int port,boolean manual,boolean tls) {
+        probe(ip,port,manual,tls,null);
+    }
+    public synchronized void probe(Peer peer) {
+        probe(peer.ip,peer.port,false,peer.encrypted(),peer.fingerprint);
+    }
+    private boolean allowsHttp(String address,String claimed) {
+        // An unauthenticated announcement or registration cannot replace a known TLS listener.
+        return !verifiedHttps.containsKey(address) && !verifiedHttps.containsValue(claimed);
+    }
+    private boolean canDial(Peer p) {
+        return p.encrypted()?identity!=null:allowsHttp(p.ip+":"+p.port,p.fingerprint);
+    }
+    private void publishPeer(Peer p) {
+        if(!fingerprint.equals(p.fingerprint) && canDial(p)) events.peer(p);
+    }
+    private void probe(String ip,int port,boolean manual,boolean tls,String claimed) {
         if(!visible || registering>=4 || port<1 || port>65535 || !ip.matches("[0-9.]{7,15}")) return;
+        String address=ip+":"+port;
+        if(tls && identity==null) {
+            if(manual) events.problem("LocalSend TLS identity unavailable");
+            return;
+        }
+        if(!tls && !allowsHttp(address,claimed)) {
+            if(manual) events.problem("Device already verified over HTTPS");
+            return;
+        }
         final int stamp=epoch;
-        String key=ip+":"+port; Long last=probes.get(key);
+        String protocol=tls?"https":"http", key=protocol+"://"+address;
+        String expectedPin=tls?(claimed==null?verifiedHttps.get(address):claimed):null;
+        Long last=probes.get(key);
         if(!manual && last!=null && now()-last<5000) return;
         if(probes.size()>=256) probes.remove(probes.keySet().iterator().next());
         probes.put(key,now()); registering++;
         thread(()->{
             try {
-                Reply r=request(ip,port,"register",info(),null,null,8,stamp);
+                Reply r=request(tls,ip,port,"register",info(),null,null,8,stamp,expectedPin);
                 if(r.code!=200) throw new IOException("Register: HTTP "+r.code);
-                Peer p=new Peer(r.json(),ip,port,"http");
-                synchronized(this) { if(discovering(stamp) && !fingerprint.equals(p.fingerprint)) events.peer(p); }
+                Peer p=new Peer(r.json(),ip,port,protocol);
+                if(tls && !p.fingerprint.equalsIgnoreCase(r.fingerprint)) throw new IOException("Registration fingerprint mismatch");
+                synchronized(this) {
+                    if(!discovering(stamp) || fingerprint.equals(p.fingerprint)) return;
+                    if(tls) {
+                        if(!verifiedHttps.containsKey(address) && verifiedHttps.size()>=MAX_TARGETS)
+                            verifiedHttps.remove(verifiedHttps.keySet().iterator().next());
+                        verifiedHttps.put(address,p.fingerprint);
+                    }
+                    publishPeer(p);
+                }
             } catch(Exception ex) { synchronized(this) { if(discovering(stamp) && manual) events.problem(reason(ex)); } }
             finally { synchronized(this) { registering--; } }
         });
@@ -304,52 +364,67 @@ public final class LocalSend implements Closeable {
     private synchronized void check(Session s) throws IOException {
         if(!open || (s!=null && s.cancelled)) throw new IOException("Cancelled");
     }
-    private synchronized int socket(Session s,int stamp) throws IOException {
+    private HttpChannel outgoingSocket(boolean tls) throws IOException {
+        if(tls && identity==null) throw new IOException("LocalSend TLS identity unavailable");
+        return HttpChannel.outgoing(tls?identity:null);
+    }
+    private synchronized HttpChannel socket(Session s,int stamp,boolean tls) throws IOException {
         check(s);
         if(s==null && !discovering(stamp)) throw new IOException("Discovery closed");
         if(s==null && clients.size()>=MAX_CLIENTS+4) throw new IOException("Busy");
-        int fd=Wire.socket(); clients.add(fd);
+        HttpChannel fd=outgoingSocket(tls); clients.add(fd);
         if(s!=null) s.sockets.add(fd); else discoverySockets.add(fd);
         return fd;
     }
-    private synchronized void release(int fd,Session s) {
-        if(s!=null) s.sockets.remove(fd);
-        discoverySockets.remove(fd); admitted.remove(fd); clients.remove(fd); Wire.close(fd);
+    private void release(HttpChannel fd,Session s) {
+        synchronized(this) {
+            if(s!=null) s.sockets.remove(fd);
+            discoverySockets.remove(fd); admitted.remove(fd); clients.remove(fd);
+        }
+        fd.close();
     }
-    private Reply request(String ip,int port,String route,JSONObject json,Source source,Session s,int timeout,int stamp) throws Exception {
-        int fd=socket(s,stamp);
+    private Reply request(Session s,String route,JSONObject json,Source source) throws Exception {
+        return request(s.peer.encrypted(),s.peer.ip,s.peer.port,route,json,source,s,0,0,s.peer.fingerprint);
+    }
+    private Reply request(boolean tls,String ip,int port,String route,JSONObject json,Source source,Session s,int timeout,int stamp,
+                          String expectedPin) throws Exception {
+        HttpChannel fd=socket(s,stamp,tls);
         try {
-            Wire.connect(fd,local,ip,port,3500); check(s); Wire.timeout(fd,timeout);
+            fd.connect(local,ip,port,3500,expectedPin,s==null && "register".equals(route)); check(s); fd.timeout(timeout);
             if(s==null && !discovering(stamp)) throw new IOException("Discovery closed");
             byte[] data=json==null?new byte[0]:buf(json.toString());
             if(data.length>MAX_JSON) throw new IOException("Offer too large");
             long n=source!=null?source.item().size:data.length;
-            Wire.write(fd,buf("POST "+API+route+" HTTP/1.1\r\nHost: "+ip+":"+port+"\r\nConnection: close\r\nContent-Type: "+
+            fd.write(buf("POST "+API+route+" HTTP/1.1\r\nHost: "+ip+":"+port+"\r\nConnection: close\r\nContent-Type: "+
                     (source!=null?"application/octet-stream":"application/json")+"\r\nContent-Length: "+n+"\r\n\r\n"));
-            if(source!=null) Wire.sendFile(fd,source.fd(),source.offset(),n,count->progress(s,source.item().id,count));
-            else if(data.length!=0) Wire.write(fd,data);
-            String[] h=utf(Wire.header(fd,true)).split("\n",2);
+            if(source!=null) fd.sendFile(source.fd(),source.offset(),n,count->progress(s,source.item().id,count));
+            else if(data.length!=0) fd.write(data);
+            String[] h=utf(fd.header(true,false)).split("\n",2);
             int status=Integer.parseInt(h[0]); long frame=Long.parseLong(h[1]);
-            return new Reply(status,status==204?new byte[0]:Wire.body(fd,frame,MAX_JSON));
+            return new Reply(status,status==204?new byte[0]:fd.body(frame,MAX_JSON),fd.peerFingerprint);
         } finally { release(fd,s); }
     }
-    private static void respond(int fd,int status,JSONObject body) throws Exception {
+    private static void respond(HttpChannel fd,int status,JSONObject body) throws Exception {
         byte[] data=body==null?new byte[0]:buf(body.toString());
-        Wire.write(fd,buf("HTTP/1.1 "+status+" "+(status<300?"OK":"Error")+
+        fd.write(buf("HTTP/1.1 "+status+" "+(status<300?"OK":"Error")+
                 "\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: "+data.length+"\r\n\r\n"));
-        if(data.length!=0) Wire.write(fd,data);
+        if(data.length!=0) fd.write(data);
     }
-    private static JSONObject json(int fd,long frame) throws Exception {
+    private static JSONObject json(HttpChannel fd,long frame) throws Exception {
         if(frame==-1) throw new Status(400,"Missing body");
-        return new JSONObject(utf(Wire.body(fd,frame,MAX_JSON)));
+        return new JSONObject(utf(fd.body(frame,MAX_JSON)));
     }
     private static String enc(String s) throws Exception { return URLEncoder.encode(s,"UTF-8"); }
-    private void serve(int fd,int stamp) {
+    private boolean sameIdentity(HttpChannel fd,Peer p) {
+        // The advertised protocol describes the peer's listener, not this connection.
+        return !receiveEncrypted || p.fingerprint.equalsIgnoreCase(fd.peerFingerprint);
+    }
+    private void serve(HttpChannel fd,int stamp) {
         boolean sessionRoute=false;
         try {
-            Wire.timeout(fd,20);
-            String ip=Wire.peer(fd);
-            String[] h=utf(Wire.header(fd,false)).split("\n",2);
+            fd.acceptTls(); fd.timeout(20);
+            String ip=fd.peer();
+            String[] h=utf(fd.header(false,false)).split("\n",2);
             String[] first=h[0].split(" ",2), uri=first[1].split("\\?",2);
             String path=uri[0]; long frame=Long.parseLong(h[1]);
             Map<String,String> q=new HashMap<>();
@@ -360,10 +435,10 @@ public final class LocalSend implements Closeable {
             synchronized(this) {
                 boolean uploading="POST".equals(first[0]) && path.equals(API+"upload");
                 boolean cancelling="POST".equals(first[0]) && path.equals(API+"cancel");
-                if(uploading) sessionRoute=ticket(ip,q)!=null;
-                if(cancelling) sessionRoute=cancellable(ip,q.get("sessionId"))!=null;
+                if(uploading) sessionRoute=ticket(fd,ip,q)!=null;
+                if(cancelling) sessionRoute=cancellable(fd,ip,q.get("sessionId"))!=null;
                 if(!discovering(stamp) && !sessionRoute) return; // no identifying response, even to /v1/info
-                if(!uploading && !cancelling) discoverySockets.add(fd);
+                if(!uploading && !cancelling) discoverySockets.add(fd); else discoverySockets.remove(fd);
             }
             if("GET".equals(first[0]) && (path.equals(API+"info") || path.equals("/api/localsend/v1/info")))
                 respond(fd,200,info());
@@ -371,17 +446,18 @@ public final class LocalSend implements Closeable {
             else switch(path.substring(API.length())) {
                 case "register":
                     Peer p=described(json(fd,frame),ip);
-                    synchronized(this) { if(!discovering(stamp)) return; if(!p.fingerprint.equals(fingerprint)) events.peer(p); }
+                    if(!sameIdentity(fd,p)) throw new Status(403,"Certificate fingerprint mismatch");
+                    synchronized(this) { if(!discovering(stamp)) return; publishPeer(p); }
                     respond(fd,200,info()); break;
                 case "prepare-upload": prepare(fd,ip,q.get("pin"),frame,stamp); break;
                 case "upload": upload(fd,ip,q,frame); break;
-                case "cancel": remoteCancel(ip,q.get("sessionId")); respond(fd,200,null); break;
+                case "cancel": remoteCancel(fd,ip,q.get("sessionId")); respond(fd,200,null); break;
                 default: throw new Status(404,"Unknown route");
             }
         } catch(Exception ex) {
             boolean reply;
             synchronized(this) { reply=sessionRoute || admitted.contains(fd) || discovering(stamp); }
-            try { if(reply) respond(fd,ex instanceof Status?((Status)ex).code:400,
+            try { if(reply && fd.ready()) respond(fd,ex instanceof Status?((Status)ex).code:400,
                     new JSONObject().put("message",reason(ex))); } catch(Exception ignored) {}
         } finally { release(fd,null); }
     }
@@ -402,11 +478,12 @@ public final class LocalSend implements Closeable {
         }
         pinFailures.remove(ip);
     }
-    private void prepare(int fd,String ip,String supplied,long frame,int stamp) throws Exception {
+    private void prepare(HttpChannel fd,String ip,String supplied,long frame,int stamp) throws Exception {
         verifyPin(ip,supplied);
         JSONObject offer=json(fd,frame), files=offer.getJSONObject("files");
         if(files.length()==0 || files.length()>MAX_FILES) throw new Status(400,"Invalid file count");
         Session s=new Session(described(offer.getJSONObject("info"),ip),null);
+        if(!sameIdentity(fd,s.peer)) throw new Status(403,"Certificate fingerprint mismatch");
         List<Item> display=new ArrayList<>(); long total=0;
         for(Iterator<String> it=files.keys();it.hasNext();) {
             String id=it.next(); JSONObject f=files.getJSONObject(id);
@@ -434,7 +511,7 @@ public final class LocalSend implements Closeable {
         boolean handedOff=false;
         try {
             while(!s.decision.await(250,TimeUnit.MILLISECONDS)) {
-                if(Wire.disconnected(fd)) throw new IOException("Sender disconnected");
+                if(fd.disconnected()) throw new IOException("Sender disconnected");
             }
             JSONObject tokens=new JSONObject();
             synchronized(this) {
@@ -456,17 +533,17 @@ public final class LocalSend implements Closeable {
             incoming.selected=ids==null?null:new HashSet<>(ids); incoming.decision.countDown();
         }
     }
-    private FileState ticket(String ip,Map<String,String> q) {
+    private FileState ticket(HttpChannel fd,String ip,Map<String,String> q) {
         Session s=incoming;
-        if(s==null || !s.peer.ip.equals(ip) || s.remoteId==null || !s.remoteId.equals(q.get("sessionId"))) return null;
+        if(s==null || !s.peer.ip.equals(ip) || !sameIdentity(fd,s.peer) || s.remoteId==null || !s.remoteId.equals(q.get("sessionId"))) return null;
         FileState f=s.files.get(q.get("fileId"));
         return f!=null && f.token.equals(q.get("token"))?f:null;
     }
-    private void upload(int fd,String ip,Map<String,String> q,long frame) throws Exception {
+    private void upload(HttpChannel fd,String ip,Map<String,String> q,long frame) throws Exception {
         final Session s; final FileState f;
         synchronized(this) {
             s=incoming;
-            f=ticket(ip,q);
+            f=ticket(fd,ip,q);
             if(f==null || f.done || f.failed) throw new Status(403,"Invalid token");
             if(f.busy) throw new Status(409,"File in progress");
             if(frame==-1 && f.item.size==0) frame=0; // HTTP request without framing has an empty body
@@ -475,8 +552,8 @@ public final class LocalSend implements Closeable {
         }
         boolean completed=false, retry=false;
         try(Sink out=events.destination(f.item,s)) {
-            Wire.timeout(fd,0); // an admitted file is interrupted explicitly, not by UI/idle timers
-            Wire.receiveFile(fd,frame,out.fd(),f.item.size,count->progress(s,f.item.id,count));
+            fd.timeout(0); // an admitted file is interrupted explicitly, not by UI/idle timers
+            fd.receiveFile(frame,out.fd(),f.item.size,count->progress(s,f.item.id,count));
             if(f.item.hash!=null && !out.matches(f.item.hash)) {
                 retry=f.tries<3; throw new Status(422,"SHA-256 mismatch");
             }
@@ -517,17 +594,17 @@ public final class LocalSend implements Closeable {
         retireIfIdle();
         events.update(s.key,s.peer.alias+" · "+label,"Sent".equals(label)||"Received".equals(label)?100:s.percent,true);
     }
-    private Session cancellable(String ip,String id) {
+    private Session cancellable(HttpChannel fd,String ip,String id) {
         // A cancel without sessionId is valid for a pending incoming offer.
-        Session match=incoming!=null && incoming.peer.ip.equals(ip) && Objects.equals(incoming.remoteId,id)?incoming:null;
-        if(id!=null) for(Session s:outgoing.values()) if(s.peer.ip.equals(ip) && id.equals(s.remoteId)) {
+        Session match=incoming!=null && incoming.peer.ip.equals(ip) && sameIdentity(fd,incoming.peer) && Objects.equals(incoming.remoteId,id)?incoming:null;
+        if(id!=null) for(Session s:outgoing.values()) if(s.peer.ip.equals(ip) && sameIdentity(fd,s.peer) && id.equals(s.remoteId)) {
             if(match!=null) return null; // same IP + remote ID cannot identify one of two peers
             match=s;
         }
         return match;
     }
-    private synchronized void remoteCancel(String ip,String id) throws Status {
-        Session s=cancellable(ip,id);
+    private synchronized void remoteCancel(HttpChannel fd,String ip,String id) throws Status {
+        Session s=cancellable(fd,ip,id);
         if(s==null) throw new Status(403,"Unknown session");
         end(s,"Cancelled");
     }
@@ -538,17 +615,15 @@ public final class LocalSend implements Closeable {
         end(s,"Cancelled"); if(notify) notifyCancel(s);
     }
     private void notifyCancel(Session s) {
-        if(!"http".equals(s.peer.protocol)) return;
         final String id=s.remoteId;
         thread(()->{
-            int fd=-1;
-            try {
-                fd=Wire.socket(); Wire.connect(fd,local,s.peer.ip,s.peer.port,1000); Wire.timeout(fd,2);
+            try(HttpChannel fd=outgoingSocket(s.peer.encrypted())) {
+                fd.connect(local,s.peer.ip,s.peer.port,1000,s.peer.fingerprint,false); fd.timeout(2);
                 String path=API+"cancel"+(id==null?"":"?sessionId="+enc(id));
-                Wire.write(fd,buf("POST "+path+" HTTP/1.1\r\nHost: "+s.peer.ip+":"+s.peer.port+
+                fd.write(buf("POST "+path+" HTTP/1.1\r\nHost: "+s.peer.ip+":"+s.peer.port+
                         "\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"));
-                Wire.header(fd,true);
-            } catch(Exception ignored) {} finally { if(fd>=0) Wire.close(fd); }
+                fd.header(true,false);
+            } catch(Exception ignored) {}
         });
     }
     public synchronized void enterPin(String key,String value) {
@@ -563,7 +638,7 @@ public final class LocalSend implements Closeable {
             events.problem("Cannot start transfer"); return false;
         }
         Set<String> ids=new HashSet<>(), addresses=new HashSet<>();
-        for(Peer p:peers) if(!"http".equals(p.protocol) || !ids.add(p.fingerprint) ||
+        for(Peer p:peers) if(!canDial(p) || !ids.add(p.fingerprint) ||
                 !addresses.add(p.ip+":"+p.port) || sendingTo(p)) {
             events.problem("Unavailable recipient: "+p.alias); return false;
         }
@@ -595,8 +670,7 @@ public final class LocalSend implements Closeable {
             Reply r; String supplied=null;
             for(;;) {
                 synchronized(this) { check(s); s.offered=true; }
-                r=request(s.peer.ip,s.peer.port,"prepare-upload"+(supplied==null?"":"?pin="+enc(supplied)),
-                        offer,null,s,0,0);
+                r=request(s,"prepare-upload"+(supplied==null?"":"?pin="+enc(supplied)),offer,null);
                 if(r.code!=401) break;
                 CountDownLatch l;
                 synchronized(this) {
@@ -616,7 +690,7 @@ public final class LocalSend implements Closeable {
                 if(source==null) throw new IOException("Unknown file ID");
                 String path="upload?sessionId="+enc(s.remoteId)+"&fileId="+enc(id)+"&token="+enc(text(tokens,id,512));
                 for(int attempt=1;;attempt++) {
-                    r=request(s.peer.ip,s.peer.port,path,null,source,s,0,0);
+                    r=request(s,path,null,source);
                     if(r.code==200) break;
                     if(r.code!=422 || attempt>=3) throw new IOException("HTTP "+r.code);
                 }

@@ -72,10 +72,20 @@ JNIEXPORT jint FN(port)(ENV, jint fd) {
     struct sockaddr_in a; socklen_t len = sizeof a;
     return getsockname(fd, (struct sockaddr *)&a, &len) ? syserr(e) : ntohs(a.sin_port);
 }
-JNIEXPORT jint FN(accept)(ENV, jint fd) {
+static int accept_peer(JNIEnv *e, int fd) {
     int s = accept4(fd, NULL, NULL, SOCK_CLOEXEC);
     if (s < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) return syserr(e);
     return s;
+}
+JNIEXPORT jint FN(accept)(ENV, jint fd) { return accept_peer(e, fd); }
+JNIEXPORT jint FN(awaitAccept)(ENV, jint fd, jint ms) {
+    struct pollfd p = {fd, POLLIN, 0};
+    int n;
+    do { n = poll(&p, 1, ms); } while (n < 0 && errno == EINTR);
+    if (n < 0) return syserr(e);
+    if (!n) return -1;
+    if (!(p.revents & POLLIN)) return bad(e, "HTTP listener closed");
+    return accept_peer(e, fd);
 }
 JNIEXPORT jstring FN(peer)(ENV, jint fd) {
     struct sockaddr_in a; socklen_t n = sizeof a; char s[INET_ADDRSTRLEN];
@@ -159,18 +169,30 @@ JNIEXPORT void FN(write)(ENV, jint fd, jbyteArray data) {
 static int eq(const char *p, size_t n, const char *s) { return strlen(s) == n && !strncasecmp(p, s, n); }
 /* Peek and consume just the header. The first body bytes remain in the kernel even
  * when a peer writes header + payload in one packet. One request per connection. */
-JNIEXPORT jbyteArray FN(header)(ENV, jint fd, jboolean response) {
+static jbyteArray read_header(JNIEnv *e, int fd, int response, int read_range, jbyteArray plain, jint plain_len) {
     char buf[HEADER_MAX], result[HEADER_MAX + 64]; size_t used = 0, used_headers;
     const char *method = "", *path = "", *msg; size_t mn = 0, pn = 0, msglen;
     int minor, status = 0; struct phr_header headers[64];
     for (;;) {
         if (used == sizeof buf) { fail(e, "HTTP header too large"); return NULL; }
-        ssize_t n = rx(fd, buf + used, sizeof buf - used, MSG_PEEK);
+        ssize_t n;
+        if (plain) {
+            if (plain_len <= 0 || plain_len > HEADER_MAX || plain_len > (*e)->GetArrayLength(e,plain)) {
+                fail(e, "Invalid decrypted header length"); return NULL;
+            }
+            (*e)->GetByteArrayRegion(e,plain,0,plain_len,(jbyte *)buf);
+            if ((*e)->ExceptionCheck(e)) return NULL;
+            n=plain_len;
+        } else n = rx(fd, buf + used, sizeof buf - used, MSG_PEEK);
         if (n <= 0) { fail(e, "Incomplete HTTP header"); return NULL; }
         used_headers = 64;
         int end = response ? phr_parse_response(buf, used+n, &minor, &status, &msg, &msglen, headers, &used_headers, used)
                            : phr_parse_request(buf, used+n, &method, &mn, &path, &pn, &minor, headers, &used_headers, used);
         if (end == -1) { fail(e, "Malformed HTTP header"); return NULL; }
+        if (plain) {
+            if (end != plain_len) { fail(e,"Incomplete HTTP header"); return NULL; }
+            break;
+        }
         size_t target = end < 0 ? used + (size_t)n : (size_t)end;
         while (used < target) {
             n = rx(fd, buf + used, target - used, 0);
@@ -180,6 +202,8 @@ JNIEXPORT jbyteArray FN(header)(ENV, jint fd, jboolean response) {
         if (end >= 0) break;
     }
     int64_t length = UNTIL_EOF;
+    const char *range = NULL;
+    size_t range_len = 0;
     for (size_t i = 0; i < used_headers; ++i) {
         struct phr_header h = headers[i];
         if (!h.name) { fail(e, "Folded HTTP header"); return NULL; }
@@ -194,13 +218,36 @@ JNIEXPORT jbyteArray FN(header)(ENV, jint fd, jboolean response) {
         } else if (eq(h.name,h.name_len,"Transfer-Encoding")) {
             if (length != UNTIL_EOF || !eq(h.value,h.value_len,"chunked")) goto framing_error;
             length = CHUNKED;
+        } else if (read_range && !range && eq(h.name,h.name_len,"Range")) {
+            range = h.value;
+            range_len = h.value_len;
         }
     }
     int k = response ? snprintf(result,sizeof result,"%d\n%" PRId64,status,length) :
         snprintf(result,sizeof result,"%.*s %.*s\n%" PRId64,(int)mn,method,(int)pn,path,length);
+    // Video uses a separate entry point; LocalSend's request line and framing stay unchanged.
+    if (k < 0 || (size_t)k >= sizeof result ||
+        (range && (size_t)k+1+range_len > sizeof result)) {
+        fail(e, "HTTP header too large"); return NULL;
+    }
+    if (range) {
+        result[k++] = '\n';
+        memcpy(result + k, range, range_len);
+        k += (int)range_len;
+    }
     return bytes(e, result, (size_t)k);
 framing_error:
     fail(e, "Invalid HTTP body framing"); return NULL;
+}
+JNIEXPORT jbyteArray FN(header)(ENV, jint fd, jboolean response) {
+    return read_header(e, fd, response, 0, NULL, 0);
+}
+JNIEXPORT jbyteArray FN(videoHeader)(ENV, jint fd) {
+    return read_header(e, fd, 0, 1, NULL, 0);
+}
+JNIEXPORT jbyteArray FN(parsedHeader)(ENV, jbyteArray data, jint len, jboolean response, jboolean video) {
+    if (!data) { fail(e,"Missing decrypted header"); return NULL; }
+    return read_header(e, -1, response, video, data, len);
 }
 typedef struct {
     JNIEnv *e; jobject target; jmethodID method; int64_t last;

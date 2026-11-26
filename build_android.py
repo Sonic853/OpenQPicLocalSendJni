@@ -14,7 +14,7 @@ ABIS = {"armeabi": "ARM", "x86": "Intel 80386", "arm64-v8a": "AArch64"}
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--ndk", required=True, type=Path, help="NDK r16b for armeabi/x86")
-    parser.add_argument("--arm64-ndk", type=Path, help="also build arm64-v8a with NDK r28+")
+    parser.add_argument("--arm64-ndk", type=Path, help="also build arm64-v8a; checks LOAD alignment (r28+ or r16b)")
     opt = parser.parse_args()
     wire = (ROOT/"java/org/openqpic/localsend/Wire.java").read_text("utf-8")
     methods = {"Java_org_openqpic_localsend_Wire_" + n for n in re.findall(r"native \S+ (\w+)\(", wire)}

@@ -11,6 +11,7 @@ final class Wire {
     static native int listen(String local, int port) throws IOException;
     static native int port(int fd);
     static native int accept(int listener) throws IOException; // nonblocking, -1 means empty
+    static native int awaitAccept(int listener, int milliseconds) throws IOException; // bounded wait
     static native String peer(int fd) throws IOException;
     static native int multicast(String local) throws IOException;
     static native void announce(int udp, byte[] json) throws IOException;
@@ -21,6 +22,8 @@ final class Wire {
     static native boolean disconnected(int fd);
     static native void close(int fd);
     static native byte[] header(int fd, boolean response) throws IOException;
+    static native byte[] videoHeader(int fd) throws IOException; // request line LF framing [LF Range]
+    static native byte[] parsedHeader(byte[] plain, int length, boolean response, boolean video) throws IOException;
     static native void write(int fd, byte[] data) throws IOException;
     static native byte[] body(int fd, long framing, int limit) throws IOException;
     static native void sendFile(int fd, int source, long offset, long size, Progress progress) throws IOException;
